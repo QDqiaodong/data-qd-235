@@ -30,6 +30,10 @@ class Broadcast:
         self._closed = False
         self._cond = Condition()
 
+    @property
+    def max_payload(self):
+        return self._max_payload
+
     def _oldest(self):
         return max(0, self._next - self._capacity)
 

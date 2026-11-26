@@ -1,6 +1,7 @@
 """Process-local endpoint discovery with rebuildable client views."""
 import json
 import re
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
@@ -16,6 +17,14 @@ _MAX_RESERVE_SERVICES = 32
 _MAX_SLOTS_PER_ADDRESS = 8
 _MAX_RESERVE_DEMAND = 64
 
+_MAX_ROLLOUT_SERVICES = 8
+_MAX_ROLLOUT_VERSIONS = 4
+_MAX_ROLLOUT_ENDPOINTS = 4
+_MAX_ROLLOUT_PROTOCOLS = 4
+_MAX_ROLLOUT_DEPENDENCIES = 16
+_MAX_ROLLOUT_BRIDGES = 4
+_MAX_PLAN_TARGETS = 8
+
 
 class SlotUnavailable(RuntimeError):
     """No slot can be granted without violating capacity or the reserve plan."""
@@ -23,6 +32,14 @@ class SlotUnavailable(RuntimeError):
 
 class NoReserve(RuntimeError):
     """take_reserve() was called while no emergency plan was registered."""
+
+
+class IncompatibleRollout(RuntimeError):
+    """A known version would make the authoritative rollout cut incompatible."""
+
+
+class NoRolloutPath(RuntimeError):
+    """No compatible sequence of single-service steps reaches the targets."""
 
 
 def _service(name):
@@ -223,6 +240,231 @@ class Lease:
                     directory._used.pop(endpoint, None)
 
 
+class _Rollout:
+    """Immutable protocol catalog plus the authoritative per-service cut."""
+
+    def __init__(self, catalog, cut, service_order):
+        self.catalog = catalog
+        self.cut = cut
+        self.service_order = service_order
+
+    def valid(self):
+        for service in self.service_order:
+            for dependency in self.catalog[service]["dependencies"]:
+                consumer = self.catalog[service]["versions"][self.cut[service]][2]
+                provider = self.catalog[dependency]["versions"][self.cut[dependency]][1]
+                if not consumer.get(dependency, frozenset()) & provider:
+                    return False
+        return True
+
+
+def _protocol_set(names, what):
+    if not isinstance(names, tuple) or not 1 <= len(names) <= _MAX_ROLLOUT_PROTOCOLS:
+        raise ValueError(f"{what} must be a tuple of 1-4 protocol names")
+    for name in names:
+        _service(name)
+    if len(set(names)) != len(names):
+        raise ValueError(f"{what} must contain distinct protocol names")
+    return frozenset(names)
+
+
+def _validated_rollout_catalog(catalog):
+    """Validate a catalog and materialize it as plain, immutable-by-convention data."""
+    if not isinstance(catalog, Mapping):
+        raise ValueError("catalog must be a mapping of service name to versions")
+    if not 1 <= len(catalog) <= _MAX_ROLLOUT_SERVICES:
+        raise ValueError("catalog must manage 1-8 services")
+    materialized = {}
+    dependency_count = 0
+    for service, versions in catalog.items():
+        _service(service)
+        if not isinstance(versions, Mapping) or not 1 <= len(versions) <= _MAX_ROLLOUT_VERSIONS:
+            raise ValueError("each service must declare 1-4 versions")
+        parsed = []
+        seen_endpoints = set()
+        dependency_keys = None
+        for version, spec in versions.items():
+            _service(version)
+            if not isinstance(spec, tuple) or len(spec) != 3:
+                raise ValueError("a version spec must be an (endpoints, protocols, dependencies) tuple")
+            endpoints, protocols, dependencies = spec
+            if (not isinstance(endpoints, tuple)
+                    or not 1 <= len(endpoints) <= _MAX_ROLLOUT_ENDPOINTS
+                    or any(not isinstance(endpoint, Endpoint) for endpoint in endpoints)
+                    or len(set(endpoints)) != len(endpoints)):
+                raise ValueError("a version needs 1-4 distinct Endpoint values")
+            if endpoints in seen_endpoints:
+                raise ValueError("versions of one service must have distinct endpoint tuples")
+            seen_endpoints.add(endpoints)
+            offered = _protocol_set(protocols, "offered protocols")
+            if not isinstance(dependencies, Mapping):
+                raise ValueError("dependencies must be a mapping")
+            if len(dependencies) > _MAX_ROLLOUT_DEPENDENCIES:
+                raise ValueError("too many dependencies")
+            accepted = {}
+            for dependency, names in dependencies.items():
+                _service(dependency)
+                if dependency == service:
+                    raise ValueError("a service cannot depend on itself")
+                if dependency not in catalog:
+                    raise ValueError("dependencies must all be in the catalog")
+                accepted[dependency] = _protocol_set(names, "accepted protocols")
+            keys = frozenset(accepted)
+            if dependency_keys is None:
+                dependency_keys = keys
+            elif keys != dependency_keys:
+                raise ValueError("all versions of a service must declare the same dependencies")
+            parsed.append((endpoints, offered, accepted))
+        dependency_count += len(dependency_keys or ())
+        materialized[service] = {
+            "versions": tuple(parsed),
+            "order": tuple(versions),
+            "dependencies": dependency_keys,
+        }
+    if dependency_count > _MAX_ROLLOUT_DEPENDENCIES:
+        raise ValueError("catalog has more than 16 directed dependencies")
+    return materialized
+
+
+def _replace_payload(service, endpoints):
+    return json.dumps(
+        [service, [(endpoint.host, endpoint.port) for endpoint in endpoints]],
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _validated_targets(targets):
+    if not isinstance(targets, Mapping) or len(targets) > _MAX_PLAN_TARGETS:
+        raise ValueError("targets must be a mapping of at most 8 services")
+    validated = {}
+    for service, version in targets.items():
+        _service(service)
+        _service(version)
+        validated[service] = version
+    return validated
+
+
+def _validated_bridges(bridges, targets):
+    if bridges is None:
+        return {}
+    if not isinstance(bridges, Mapping) or len(bridges) > _MAX_PLAN_TARGETS:
+        raise ValueError("bridges must be a mapping of at most 8 services")
+    validated = {}
+    for service, versions in bridges.items():
+        _service(service)
+        if service not in targets:
+            raise ValueError("bridges may only name services in targets")
+        if (not isinstance(versions, tuple)
+                or len(versions) > _MAX_ROLLOUT_BRIDGES):
+            raise ValueError("a bridge must list at most 4 version names")
+        for version in versions:
+            _service(version)
+        if len(set(versions)) != len(versions):
+            raise ValueError("bridge versions must be distinct")
+        validated[service] = frozenset(versions)
+    return validated
+
+
+def _plan_rollout(rollout, targets, bridges):
+    """Breadth-first search over reachable per-service versions.
+
+    A state assigns every managed service a version index.  Unlisted services
+    stay where the plan starts; listed services may use their start, target, or
+    explicitly bridged versions.  Every transition changes exactly one service
+    and is kept only while the whole cut remains compatible.  Breadth-first
+    expansion over services in catalog order then version order returns a
+    shortest plan deterministically; ties between equally short plans are
+    resolved by that order.
+
+    Compatibility is precomputed per dependency edge, and a transition only
+    re-checks the edges touching the service that changed, so the search stays
+    small at the documented limits (8 services, 4 versions each).
+    """
+    catalog = rollout.catalog
+    services = rollout.service_order
+    position = {service: offset for offset, service in enumerate(services)}
+    start = tuple(rollout.cut[service] for service in services)
+    order_of = {service: catalog[service]["order"] for service in services}
+
+    desired = list(start)
+    for service, version in targets.items():
+        desired[position[service]] = order_of[service].index(version)
+
+    allowed = {}
+    for offset, service in enumerate(services):
+        if service not in targets:
+            allowed[offset] = (start[offset],)
+            continue
+        indices = {start[offset], desired[offset]}
+        for version in bridges.get(service, ()):
+            indices.add(order_of[service].index(version))
+        allowed[offset] = tuple(sorted(indices))
+
+    goal = tuple(desired)
+    if start == goal:
+        return ()
+
+    # edge_ok[(consumer_offset, dependency_offset)][ci][di] is True when the
+    # consuming version accepts at least one protocol the provider offers.
+    edges = []
+    edge_ok = {}
+    touching = [[] for _ in services]
+    for offset, service in enumerate(services):
+        entry = catalog[service]
+        versions = entry["versions"]
+        for dependency in entry["dependencies"]:
+            dep_offset = position[dependency]
+            provided = [frozenset(v[1]) for v in catalog[dependency]["versions"]]
+            table = [
+                tuple(bool(v[2].get(dependency, frozenset()) & provided[di])
+                      for di in range(len(provided)))
+                for v in versions
+            ]
+            edge_ok[(offset, dep_offset)] = table
+            edges.append((offset, dep_offset))
+            touching[offset].append((offset, dep_offset))
+            touching[dep_offset].append((offset, dep_offset))
+
+    def state_ok(state):
+        for consumer, dependency in edges:
+            if not edge_ok[(consumer, dependency)][state[consumer]][state[dependency]]:
+                return False
+        return True
+
+    if not state_ok(start):
+        return None
+
+    parents = {start: None}
+    steps = {start: None}
+    queue = deque([start])
+    while queue:
+        state = queue.popleft()
+        for offset in range(len(services)):
+            for index in allowed[offset]:
+                if index == state[offset]:
+                    continue
+                successor = state[:offset] + (index,) + state[offset + 1:]
+                if successor in parents:
+                    continue
+                if not all(
+                        edge_ok[(consumer, dependency)][successor[consumer]][successor[dependency]]
+                        for consumer, dependency in touching[offset]):
+                    continue
+                parents[successor] = state
+                steps[successor] = (
+                    services[offset], catalog[services[offset]]["versions"][index][0])
+                if successor == goal:
+                    plan = []
+                    node = successor
+                    while parents[node] is not None:
+                        plan.append(steps[node])
+                        node = parents[node]
+                    plan.reverse()
+                    return tuple(plan)
+                queue.append(successor)
+    return None
+
+
 class Directory:
     """Authoritative endpoint sets and a bounded stream of replacements."""
 
@@ -235,6 +477,7 @@ class Directory:
         self._slot_limits = _validated_slot_limits(slot_limits)
         self._used = {}
         self._reserve = None
+        self._rollout = None
 
     def replace(self, service, endpoints):
         """Replace one service atomically; empty removes it, unchanged is a no-op."""
@@ -248,14 +491,113 @@ class Directory:
                 raise Closed("directory closed")
             if self._entries.get(service, ()) == endpoints:
                 return None
-            payload = json.dumps(
-                [service, [(ep.host, ep.port) for ep in endpoints]],
-                separators=(",", ":"),
-            ).encode("ascii")
+            rollout = self._rollout
+            next_cut = None
+            if rollout is not None and service in rollout.catalog:
+                next_cut = self._rollout_transition(rollout, service, endpoints)
+            payload = _replace_payload(service, endpoints)
             sequence = self._bus.publish(payload)
             _replace(self._entries, service, endpoints)
+            if next_cut is not None:
+                rollout.cut = next_cut
             self._next = sequence + 1
             return sequence
+
+    def configure_protocol_rollout(self, catalog):
+        """Enable protocol-compatible rolling changes for 1-8 managed services.
+
+        All validation happens before any state changes: the catalog must be
+        consistent, every managed service must already publish a legal version,
+        the starting cut must be compatible, and every version's replace event
+        must fit the directory's payload bound.  A rejected call enables nothing.
+        """
+        with self._lock:
+            if self._closed:
+                raise Closed("directory closed")
+            if self._rollout is not None:
+                raise ValueError("protocol rollout already configured")
+            materialized = _validated_rollout_catalog(catalog)
+            cut = {}
+            for service in materialized:
+                current = self._entries.get(service)
+                if not current:
+                    raise ValueError("managed service has no published endpoints")
+                cut[service] = self._locate_version_under_lock(materialized, service, current)
+            projected = _Rollout(materialized, cut, tuple(materialized))
+            if not projected.valid():
+                raise ValueError("the starting cut is not protocol compatible")
+            bound = self._bus.max_payload
+            for service, entry in materialized.items():
+                for endpoints, _offered, _accepted in entry["versions"]:
+                    if len(_replace_payload(service, endpoints)) > bound:
+                        raise ValueError("a version exceeds the event payload bound")
+            self._rollout = projected
+            return None
+
+    @staticmethod
+    def _locate_version_under_lock(catalog, service, endpoints):
+        entry = catalog[service]
+        for index, (version_endpoints, _offered, _accepted) in enumerate(entry["versions"]):
+            if version_endpoints == endpoints:
+                return index
+        raise ValueError("endpoints do not match any declared version")
+
+    def _rollout_transition(self, rollout, service, endpoints):
+        """Return the next cut for a known version, or raise without side effects.
+
+        The current cut, the catalog and the published endpoint tuple are all
+        read under the caller's lock, so a compatibility decision and the
+        publication it guards cannot be split by another replacement.
+        """
+        if not endpoints:
+            raise ValueError("cannot withdraw a managed service")
+        try:
+            index = self._locate_version_under_lock(rollout.catalog, service, endpoints)
+        except ValueError:
+            raise ValueError("endpoints do not match any declared version") from None
+        current = rollout.cut[service]
+        if current == index:
+            return None
+        next_cut = dict(rollout.cut)
+        next_cut[service] = index
+        candidate = _Rollout(rollout.catalog, next_cut, rollout.service_order)
+        if not candidate.valid():
+            raise IncompatibleRollout("the new cut would be protocol incompatible")
+        return next_cut
+
+    def plan_protocol_rollout(self, targets, bridges=None):
+        """Return a minimal sequence of single-service steps to reach ``targets``.
+
+        The plan is computed from the authoritative cut under the lock but does
+        not reserve anything; the caller must still publish each step through
+        ``replace``, which re-checks compatibility at that moment.
+        """
+        with self._lock:
+            rollout = self._rollout
+            if rollout is None:
+                if self._closed:
+                    raise Closed("directory closed")
+                raise ValueError("protocol rollout is not configured")
+            if self._closed:
+                raise Closed("directory closed")
+            validated_targets = _validated_targets(targets)
+            validated_bridges = _validated_bridges(bridges, validated_targets)
+            for service, version in validated_targets.items():
+                if service not in rollout.catalog:
+                    raise ValueError("targets must name managed services")
+                if version not in rollout.catalog[service]["order"]:
+                    raise ValueError("target version is not declared")
+            for service, versions in validated_bridges.items():
+                order = rollout.catalog[service]["order"]
+                for version in versions:
+                    if version not in order:
+                        raise ValueError("bridge version is not declared")
+            # Snapshot the authoritative cut so the search itself holds no lock.
+            snapshot = _Rollout(rollout.catalog, dict(rollout.cut), rollout.service_order)
+        plan = _plan_rollout(snapshot, validated_targets, validated_bridges)
+        if plan is None:
+            raise NoRolloutPath("no compatible rollout path reaches the targets")
+        return plan
 
     def set_reserve(self, demand):
         """Register or replace the next emergency demand.
