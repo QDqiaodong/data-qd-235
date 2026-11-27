@@ -4,7 +4,7 @@ import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, RLock
 
 from broadcast import Broadcast, Closed, Lagged
 
@@ -25,9 +25,29 @@ _MAX_ROLLOUT_DEPENDENCIES = 16
 _MAX_ROLLOUT_BRIDGES = 4
 _MAX_PLAN_TARGETS = 8
 
+_MAX_DRAIN_ENDPOINTS = 32
+_MAX_TRACKED_VIEWS = 64
+_MAX_ROUTES = 256
+
 
 class SlotUnavailable(RuntimeError):
     """No slot can be granted without violating capacity or the reserve plan."""
+
+
+class RouteUnavailable(RuntimeError):
+    """No tracked view at this cut may protect that address right now."""
+
+
+class RouteLimit(RuntimeError):
+    """A tracked-view or route-protection limit would be exceeded."""
+
+
+class DrainConflict(RuntimeError):
+    """The address is still published or already has an open handoff."""
+
+
+class DrainPending(RuntimeError):
+    """finish() was called while protected requests are still outstanding."""
 
 
 class NoReserve(RuntimeError):
@@ -79,6 +99,20 @@ def _validated_slot_limits(slot_limits):
             raise ValueError("slot count must be an integer from 1 to 8")
         limits[endpoint] = slots
     return limits
+
+
+def _validated_drain_endpoints(drain_endpoints):
+    if drain_endpoints is None:
+        return frozenset()
+    if not isinstance(drain_endpoints, tuple):
+        raise ValueError("drain_endpoints must be a tuple of Endpoint values")
+    if len(drain_endpoints) > _MAX_DRAIN_ENDPOINTS:
+        raise ValueError("too many drain endpoints")
+    if any(not isinstance(endpoint, Endpoint) for endpoint in drain_endpoints):
+        raise ValueError("drain_endpoints must contain Endpoint values")
+    if len(set(drain_endpoints)) != len(drain_endpoints):
+        raise ValueError("drain_endpoints must be distinct")
+    return frozenset(drain_endpoints)
 
 
 def _validated_reserve(demand):
@@ -468,9 +502,10 @@ def _plan_rollout(rollout, targets, bridges):
 class Directory:
     """Authoritative endpoint sets and a bounded stream of replacements."""
 
-    def __init__(self, *, capacity, max_payload=65536, slot_limits=None):
+    def __init__(self, *, capacity, max_payload=65536, slot_limits=None,
+                 drain_endpoints=()):
         self._bus = Broadcast(capacity=capacity, max_payload=max_payload)
-        self._lock = Lock()
+        self._lock = RLock()
         self._entries = {}
         self._next = 0
         self._closed = False
@@ -478,6 +513,15 @@ class Directory:
         self._used = {}
         self._reserve = None
         self._rollout = None
+        # Drain handoff state.  ``_drain_endpoints`` is the configured set of
+        # addresses this directory manages handoffs for; ``_drains`` maps an
+        # Endpoint to the single open handoff for that address.
+        self._drain_endpoints = _validated_drain_endpoints(drain_endpoints)
+        self._tracked = set()          # tracked View objects still open
+        self._drains = {}              # Endpoint -> Drain currently open
+        self._min_origin = {}          # Endpoint -> earliest usable publication cut
+        self._route_counts = {}        # Endpoint -> live RouteProtection count
+        self._routes = 0               # live RouteProtection objects (total)
 
     def replace(self, service, endpoints):
         """Replace one service atomically; empty removes it, unchanged is a no-op."""
@@ -491,6 +535,10 @@ class Directory:
                 raise Closed("directory closed")
             if self._entries.get(service, ()) == endpoints:
                 return None
+            for drain in self._drains.values():
+                if drain._endpoint in endpoints:
+                    raise DrainConflict(
+                        "endpoint is being drained until finish()")
             rollout = self._rollout
             next_cut = None
             if rollout is not None and service in rollout.catalog:
@@ -666,14 +714,232 @@ class Directory:
             # No replacement can split the copied state from its subscription cut.
             return self._entries.copy(), self._next, self._bus.subscribe(start=self._next)
 
-    def watch(self):
-        """Open a client view at the current state, not at the oldest event."""
-        return View(self)
+    def watch(self, tracked=False):
+        """Open a client view at the current state, not at the oldest event.
+
+        ``tracked=True`` creates a view that may take part in a drain handoff
+        and use ``open_route``.  A plain view keeps the original behaviour and
+        can never protect a route.
+        """
+        if not isinstance(tracked, bool):
+            raise ValueError("tracked must be a bool")
+        with self._lock:
+            if tracked:
+                if self._closed:
+                    raise Closed("directory closed")
+                if len(self._tracked) >= _MAX_TRACKED_VIEWS:
+                    raise RouteLimit("too many tracked views are already open")
+            view = View(self, tracked=tracked)
+            if tracked:
+                self._tracked.add(view)
+            return view
+
+    def _view_closed(self, view):
+        """A tracked view that closes stops blocking any handoff at once."""
+        with self._lock:
+            self._tracked.discard(view)
+
+    def _route_eligible(self, endpoint, origin):
+        """Whether a publication first applied at ``origin`` may start a route.
+
+        ``_min_origin`` is the earliest cut whose publication of this address
+        may still be used.  While the *current* handoff is ``pending`` it has
+        not yet fenced off its old round, so a view of that round keeps
+        serving; but any boundary left by an *earlier* handoff still applies,
+        so an older round is never revived.  Once the current handoff reaches
+        ``ready`` its drain cut is latched, and only publications first seen at
+        or after it may start a request -- excluding a retained old-round event
+        replayed after ``finish`` even when it carries the identical host/port.
+        """
+        drain = self._drains.get(endpoint)
+        if drain is not None:
+            # Refresh readiness first so an advance that just cleared the last
+            # blocker is reflected without waiting for a separate state poll.
+            self._drain_state(drain)
+            if not drain._ready:
+                prior = drain._prior_threshold
+                return prior is None or origin >= prior
+        threshold = self._min_origin.get(endpoint)
+        return threshold is None or origin >= threshold
+
+    def _drain_blockers(self, drain):
+        """Whether anything still forbids declaring the handoff ready.
+
+        A live route protection always blocks.  A tracked view blocks while it
+        currently resolves the drained address: during ``pending`` such a view
+        is still allowed to keep serving, so the operator waits until it closes
+        or advances past the address.  A view that does not currently show the
+        address can neither start an old request nor make the drained address
+        reappear, so it never blocks.  After the directory closes no view can
+        start a request, so only in-flight protections count.
+        """
+        endpoint = drain._endpoint
+        if self._route_counts.get(endpoint, 0) > 0:
+            return True
+        if self._closed:
+            return False
+        for view in self._tracked:
+            if view._closed:
+                continue
+            if view._shows_address(endpoint):
+                return True
+        return False
+
+    def _drain_state(self, drain):
+        """Recompute a drain's state under the lock (pending/ready/finished).
+
+        Readiness is monotonic and evaluated on demand, so it never depends on
+        a timer, a background scan, or a further publication: as soon as the
+        last blocker clears, the next query sees ``ready``.  Crossing into
+        ``ready`` latches the publication boundary for the address, so from
+        then on a retained old event can never start a new request.
+        """
+        if drain._finished:
+            return "finished"
+        if not drain._ready and not self._drain_blockers(drain):
+            drain._ready = True
+            previous = self._min_origin.get(drain._endpoint)
+            if previous is None or drain._cut > previous:
+                self._min_origin[drain._endpoint] = drain._cut
+        return "ready" if drain._ready else "pending"
+
+    def begin_drain(self, endpoint):
+        """Begin a handoff for one withdrawn listening address.
+
+        The address must no longer be published anywhere in the authoritative
+        directory and must not already have an open handoff.  A successful
+        call returns the new ``Drain`` immediately; it does not wait for views
+        or requests.
+        """
+        if not isinstance(endpoint, Endpoint):
+            raise ValueError("begin_drain requires an Endpoint")
+        with self._lock:
+            if self._closed:
+                raise Closed("directory closed")
+            if endpoint not in self._drain_endpoints:
+                raise ValueError("address is not managed by this directory")
+            current = self._drains.get(endpoint)
+            if current is not None:
+                raise DrainConflict("a handoff for this address is already open")
+            # Judge publication across the entire authoritative directory, not
+            # just one service name.
+            if any(endpoint in endpoints for endpoints in self._entries.values()):
+                raise DrainConflict("address is still published")
+            # A new round starts only from this cut; the boundary is latched in
+            # ``_min_origin`` when readiness is reached.  Any boundary left by
+            # an earlier handoff remains in force for this one's ``pending``
+            # phase via ``_prior_threshold``.
+            drain = Drain(self, endpoint, self._next)
+            drain._prior_threshold = self._min_origin.get(endpoint)
+            self._drains[endpoint] = drain
+            self._drain_state(drain)
+            return drain
+
+    def _open_route(self, view, service, endpoint):
+        """Validate and grant one request protection for a tracked view."""
+        with self._lock:
+            if self._closed:
+                raise Closed("directory closed")
+            if view._closed:
+                raise Closed("view closed")
+            _service(service)
+            if not isinstance(endpoint, Endpoint):
+                raise ValueError("endpoint must be an Endpoint")
+            if endpoint not in self._drain_endpoints:
+                raise ValueError("address is not managed by this directory")
+            if not view._tracked:
+                raise RouteUnavailable("view does not participate in handoff")
+            # The address must be in this view's own current cut for the
+            # service; open_route never advances the view or borrows a
+            # publication the view has not actually seen.
+            visible = view._entries.get(service, ())
+            if endpoint not in visible:
+                raise RouteUnavailable("endpoint is not on this view's route")
+            # The view must still be eligible to start a request on that
+            # publication round.  A view that lost eligibility cannot be used
+            # even if it still resolves the very same host/port.
+            origin = view._address_origin.get((service, endpoint))
+            if origin is None or not self._route_eligible(endpoint, origin):
+                raise RouteUnavailable("view cut is no longer eligible")
+            if self._routes >= _MAX_ROUTES:
+                raise RouteLimit("too many protected routes are open")
+            self._routes += 1
+            self._route_counts[endpoint] = self._route_counts.get(endpoint, 0) + 1
+            return RouteProtection(self, endpoint)
+
+    def _close_route(self, endpoint):
+        with self._lock:
+            self._routes -= 1
+            remaining = self._route_counts.get(endpoint, 0) - 1
+            if remaining > 0:
+                self._route_counts[endpoint] = remaining
+            else:
+                self._route_counts.pop(endpoint, None)
 
     def close(self):
         with self._lock:
             self._closed = True
             self._bus.close()
+
+
+class Drain:
+    """A handoff for one listening address, from begin_drain to finish()."""
+
+    def __init__(self, directory, endpoint, cut):
+        self._directory = directory
+        self._endpoint = endpoint
+        self._cut = cut              # authoritative cut at begin_drain
+        self._prior_threshold = None  # boundary from an earlier handoff
+        self._ready = False
+        self._finished = False
+
+    @property
+    def endpoint(self):
+        return self._endpoint
+
+    @property
+    def state(self):
+        """One of ``pending``, ``ready`` or ``finished`` (in that order)."""
+        with self._directory._lock:
+            return self._directory._drain_state(self)
+
+    def finish(self):
+        """End a ready handoff; a repeat finish is a no-op.
+
+        Raises ``DrainPending`` while the handoff is not yet ready, so a caller
+        cannot stop the old listener early.  Ending this object never releases
+        the next handoff for the same address.
+        """
+        directory = self._directory
+        with directory._lock:
+            if self._finished:
+                return
+            if directory._drain_state(self) != "ready":
+                raise DrainPending("protected requests are still outstanding")
+            self._finished = True
+            if directory._drains.get(self._endpoint) is self:
+                del directory._drains[self._endpoint]
+
+
+class RouteProtection:
+    """One caller-held protection of a chosen listening address."""
+
+    def __init__(self, directory, endpoint):
+        self._directory = directory
+        self._endpoint = endpoint
+        self._closed = False
+
+    @property
+    def endpoint(self):
+        return self._endpoint
+
+    def close(self):
+        directory = self._directory
+        with directory._lock:
+            if self._closed:
+                return
+            self._closed = True
+            directory._close_route(self._endpoint)
 
 
 def _replace(entries, service, endpoints):
@@ -686,10 +952,20 @@ def _replace(entries, service, endpoints):
 class View:
     """Single-owner lookup view; apply changes explicitly before resolving."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, tracked=False):
         self._directory = directory
         self._entries, self._next, self._sub = directory._attach()
         self._closed = False
+        self._tracked = tracked
+        # For every address visible in this view, the cut at which the current
+        # publication of that address was first observed.  This separates an
+        # old publication round from a later one carrying the same host/port.
+        # A snapshot's contents are, by definition, no later than the cut at
+        # which the view starts reading events, so they originate there.
+        self._address_origin = {}
+        for service, endpoints in self._entries.items():
+            for endpoint in endpoints:
+                self._address_origin[(service, endpoint)] = self._next
 
     @property
     def next_sequence(self):
@@ -708,26 +984,77 @@ class View:
             raise Closed("view closed")
         return self._directory._acquire(self, service)
 
+    def open_route(self, service, endpoint):
+        """Protect a chosen address from this view's current cut.
+
+        The address must be a managed endpoint that this view already resolves
+        for ``service``.  The returned object holds the protection until its
+        ``close()``; advancing or closing the view never releases it.
+        """
+        if self._closed:
+            raise Closed("view closed")
+        return self._directory._open_route(self, service, endpoint)
+
+    def _shows_address(self, endpoint):
+        for endpoints in self._entries.values():
+            if endpoint in endpoints:
+                return True
+        return False
+
+    def _apply_event(self, service, endpoints, sequence):
+        _replace(self._entries, service, endpoints)
+        for key in [key for key in self._address_origin if key[0] == service]:
+            del self._address_origin[key]
+        for endpoint in endpoints:
+            # The event's own sequence identifies its publication round.  A
+            # retained old join replayed after finish keeps its low, pre-drain
+            # sequence and so stays ineligible; consuming a genuinely new
+            # publication advances the origin past the drain cut.
+            self._address_origin[(service, endpoint)] = sequence
+
+    def _adopt_snapshot(self, entries, next_sequence):
+        """Adopt a full authoritative snapshot, resetting per-address origins."""
+        self._entries = entries
+        self._address_origin = {}
+        for service, endpoints in entries.items():
+            for endpoint in endpoints:
+                self._address_origin[(service, endpoint)] = next_sequence
+
     def advance(self, timeout=0):
         """Apply one retained replacement, or rebuild the view after a gap."""
+        directory = self._directory
         if self._closed:
             raise Closed("view closed")
         try:
             try:
                 event = self._sub.recv(timeout)
             except Lagged:
-                entries, next_sequence, sub = self._directory._attach()
-                self._sub.close()
-                self._entries, self._next, self._sub = entries, next_sequence, sub
+                entries, next_sequence, sub = directory._attach()
+                with directory._lock:
+                    if self._closed:
+                        sub.close()
+                        raise Closed("view closed")
+                    self._sub.close()
+                    self._sub = sub
+                    self._next = next_sequence
+                    self._adopt_snapshot(entries, next_sequence)
                 return Progress(self._next, True)
         except Closed:
             self.close()
             raise
         service, addresses = json.loads(event.data)
-        _replace(self._entries, service, tuple(Endpoint(*address) for address in addresses))
-        self._next = event.sequence + 1
+        endpoints = tuple(Endpoint(*address) for address in addresses)
+        with directory._lock:
+            self._apply_event(service, endpoints, event.sequence)
+            self._next = event.sequence + 1
         return Progress(self._next, False)
 
     def close(self):
-        self._closed = True
-        self._sub.close()
+        directory = self._directory
+        with directory._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._sub.close()
+            if self._tracked:
+                directory._tracked.discard(self)
