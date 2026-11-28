@@ -161,3 +161,61 @@ after removal: no endpoint
 同一读取器后续独立 `fetch` 会跳过仍在故障记录中的地址（即使视图仍把它排第一），且不为它
 调用 `open_stream`；新建读取器不继承记录。记录最多保留 64 个不同地址，满时淘汰最早一条。
 不做素材同步、目录发布管理或连接槽分配；目录、广播、预留槽、滚动协议与停机交接行为不变。
+
+## 调用侧批量查询
+
+`batch_client.BatchClient(service, views, limits, transport)` 在调用方一侧把多个调用方的小查询
+合批到同一后端。一个实例只服务一个服务：`views` 是调用方 ID 到它自己持有的 `View` 的映射
+（1–8 个调用方），`limits` 是 `Endpoint → 该地址最多同时承担的未结算查询条数`（1–8 个配置地址，
+每条上限 1–8）。组件不推进任何视图，只在每次 `dispatch()` 时调用该调用方视图的
+`View.resolve(service)` 取当前切点；一个地址必须同时出现在该调用方视图和 `limits` 中才会被使用。
+实例最多保留 64 个尚未取走终态的请求，超出 `enqueue` 抛 `OverflowError`。方法由同一事件循环
+串行调用，transport 回调不重入；仅使用标准库。
+
+最小例子（视图仍由调用方自己从 `Directory.watch()` 取得并按需 `advance()`）：
+
+```python
+from directory import Directory, Endpoint
+from batch_client import BatchClient, OutcomeUnknown
+
+directory = Directory(capacity=8)
+view_a = directory.watch()
+view_b = directory.watch()
+directory.replace("render", (Endpoint("10.0.0.1", 9000),
+                             Endpoint("10.0.0.2", 9000)))
+
+client = BatchClient(
+    "render",
+    {"a": view_a, "b": view_b},
+    {Endpoint("10.0.0.1", 9000): 1, Endpoint("10.0.0.2", 9000): 2},
+    transport,  # 提供 submit(batch_id, endpoint, items) 与 lookup(batch_id)
+)
+
+request_id = client.enqueue("a", "query string")   # 整数 ID，实例内不复用
+client.dispatch()                                   # 合批并尝试发送
+terminal = client.take(request_id)                  # ("ok", value) / ("cancelled", None) / None
+```
+
+- **入队与取消**：`enqueue(caller, payload)` 只接受字符串，未知调用方抛 `ValueError`。
+  `cancel(request_id)` 首次成功撤销一个尚未交付终态的请求时返回 `True`；已取消、已完成或未知 ID
+  返回 `False`。`take(request_id)` 取走终态后删除该请求记录，因此也释放这个调用方侧的收件名额；
+  没有可取终态（含已取过、未知 ID）时返回 `None`。每个调用方严格按提交顺序执行，同一时间至多有
+  一个未结算的后端查询。
+- **排队取消 vs 在途取消**：取消仍在排队的请求会立即放行该调用方的下一项。取消一个已经尝试发出、
+  但还无法确认后端是否接单的请求时，调用方可以立即 `take` 到 `("cancelled", None)`，但在确认未
+  接单或该批结算之前，这条请求仍占用原地址的后端额度并挡住同一调用方的下一项。
+- **调度**：`dispatch()` 先在剩余额度内为每个可执行调用方的队首规划地址并发送，再推进未决批次的
+  恢复。同一视图和额度下，只要计划中的批次都被接单，本轮实际发出的不同请求数达到本轮可发送的
+  最大值；同一地址本轮至多一个新批次，选中该地址的查询合在这一个批次里。只剩一个可选端点的请求
+  优先于可以改投其他端点的请求，后者不会挤掉前者。未接单的请求保留原提交次序等下轮；组件不自动
+  推进视图，也不给已接单的请求改路由。
+- **接单未知与额度释放**：`transport.submit` 返回 `True`/`False` 表示已接单/明确未接单；模块导出的
+  `OutcomeUnknown` 表示无法确定。`transport.lookup(batch_id)` 返回 `True`/`False`/`None`。未决批次在
+  查明前保留整批后端额度和原调用方顺序，但不影响与之无冲突的查询发送。transport 对同一批次 ID 与
+  完全一致的地址和 items 支持幂等重送：恢复时沿用原批次 ID、地址和 items，返回既有结论且不第二次
+  执行；仍无法确定时可再抛 `OutcomeUnknown`。**确认未接单后才释放该地址额度**，未取消的请求按原顺序
+  重新调度；已接单则继续等结算，结算时才释放额度。
+- **结算**：`settle(batch_id, values)` 处理整批结算，`values` 是以请求 ID 为键的字符串结果映射，顺序
+  可变但必须恰好包含这批的全部原成员（含已取消项）。有效结算返回 `True`，并能直接确认一个尚未查清
+  的批次已接单；未知或已结算 ID、成员缺失或多出、值不是字符串都返回 `False` 且不改任何状态。重复或
+  迟到的旧批次结算不会释放新批次额度，也不会投递给新请求。每个终态至多交付一次。
