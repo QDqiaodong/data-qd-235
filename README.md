@@ -219,3 +219,85 @@ terminal = client.take(request_id)                  # ("ok", value) / ("cancelle
   可变但必须恰好包含这批的全部原成员（含已取消项）。有效结算返回 `True`，并能直接确认一个尚未查清
   的批次已接单；未知或已结算 ID、成员缺失或多出、值不是字符串都返回 `False` 且不改任何状态。重复或
   迟到的旧批次结算不会释放新批次额度，也不会投递给新请求。每个终态至多交付一次。
+
+## 跨服务调用链的途中续做
+
+`workflow_router.WorkflowRouter(services, domains, links)` 管理一条分阶段内部调用链：
+`services` 是按次序执行的 2–6 个不同服务名；`domains` 把最多 24 个 `Endpoint` 映射到故障域名
+（域名沿用服务名格式，最多 6 个不同域；同一地址无论出现在哪个服务都属于同一个域）；
+`links` 是最多 80 条互不重复的 `(前一步服务, 前一步 Endpoint, 后一步服务, 后一步 Endpoint)`
+交接，只能连接相邻两步、且两端地址都在 `domains` 中。只有列出的交接才允许后一步消费前一步的回执；
+它只描述回执可用性，不表示后一步要再拨打前一步的地址。首步没有前驱。配置无效抛 `ValueError`，
+构造后修改传入的映射/元组不影响已生效的规则。每次 `preflight`/`run` 只读取调用方视图在那一刻的
+`View.resolve` 结果：不推进视图、不借用视图没见过的地址、不用于未登记的地址；某个服务一次可见
+超过 4 个端点时整次调用直接抛 `ValueError`（`run` 不会发出任何请求）。
+
+```python
+from directory import Directory, Endpoint
+from workflow_router import WorkflowRouter
+
+source_a, source_b = Endpoint("rack-a", 9001), Endpoint("rack-b", 9001)
+render_a, render_b = Endpoint("rack-a", 9002), Endpoint("rack-b", 9002)
+record_a, record_b = Endpoint("rack-a", 9003), Endpoint("rack-b", 9003)
+
+directory = Directory(capacity=8)
+directory.replace("source", (source_a, source_b))
+directory.replace("render", (render_a, render_b))
+directory.replace("record", (record_a, record_b))
+view = directory.watch()
+
+router = WorkflowRouter(
+    ("source", "render", "record"),
+    {source_a: "rack-a", source_b: "rack-b", render_a: "rack-a",
+     render_b: "rack-b", record_a: "rack-a", record_b: "rack-b"},
+    (("source", source_a, "render", render_a),
+     ("source", source_b, "render", render_a),
+     ("source", source_b, "render", render_b),
+     ("render", render_a, "record", record_a),
+     ("render", render_b, "record", record_b),
+     ("render", render_b, "record", record_a)),   # 让“途中续做”成立的那条交接
+)
+
+print(router.preflight(view))   # PreflightResult(route_exists=True, cold_blocked=(), protected=True)
+
+def invoke(service, endpoint, previous_receipt):
+    # 真正向后端发请求；首步 previous_receipt 为 None。
+    # 收据上限 4096 字节；只有确认整域不可用且无副作用时才可抛 DomainUnavailable。
+    return ("%s@%s" % (service, endpoint.host)).encode("ascii")
+
+print(router.run(view, invoke))  # 按执行次序的 (service, endpoint, receipt)
+view.close()
+directory.close()
+```
+
+- **两种容灾，两种问题**。`preflight(view)` 只读当前视图、不拨号也不改目录或视图，返回
+  `PreflightResult`：
+  - `route_exists`：只用当前可见且已标记的地址，能否找出一条完整合法链。
+  - `cold_blocked`：对当前可见地址所涉及的每个域，逐个假定它从第一步之前就不可用（每次只丢一个），
+    返回那些一旦删去便无法从头跑完整链的域名，按字典序排列。
+  - `protected`：是否存在一条完整的正常链，它在**任何一步第一次报告整域不可用**时仍能从该步继续：
+    对此前实际已完成的步骤，固定其已用地址和最后一份回执，只允许失败这一步及其后续避开该域重选，
+    已成功的步骤不换实例重来。没有正常链时为 `False`。`cold_blocked` 为空**不**蕴含
+    `protected` 为真——“两个域各丢一个都还能从头跑”并不等于“跑到一半丢一个还能接着跑”。
+
+- **执行**：`run(view, invoke)` 先选出任意一条满足保护承诺的正常链；不存在时抛 `NoProtectedWorkflow`，
+  一次也不调用 `invoke`，绝不先做一半再发现兑现不了承诺。每步调用
+  `invoke(service, endpoint, previous_receipt)`：首步回执入参为 `None`，以后传前一步成功返回的原始
+  回执。成功回执须是 `bytes`、最多 4096 字节；否则抛 `ValueError`，不重试该步，也不执行后续步骤。
+  正常完成返回按执行次序排列的 `(service, endpoint, receipt)` 元组，只含成功步骤。
+
+- **`DomainUnavailable` 与途中续做**。传输层只有在确认当前目标的**整个故障域**不可用、且本次尝试
+  **没有产生任何副作用**时，才可以抛模块导出的 `DomainUnavailable`。`run` 第一次收到它时保留已成功
+  的步骤，从失败这一步继续，失败步骤仍用同一份前驱回执；本次调用剩余步骤都不得再向该域的任何地址
+  发请求。不重做前缀、不发往没有交接关系的实例——只有 `links` 明确允许的交接才能承接回执；已拿到的
+  回执属于调用方，签发它的域稍后不可用也不影响它继续被消费。同一次调用最多吸收这一个域的故障：
+  再次抛出 `DomainUnavailable`、首次遇到其他异常（包括无法确认有无副作用的断线）、或找不到合法续做
+  链时，都原样向上抛出，不擅自重试。不跨调用记录故障，不做后台探测或多路实发；调用方独占视图，
+  `invoke` 不重入本组件。
+
+- **对照小拓扑**：三个服务各在甲、乙两域有一个地址；取材甲只交给制图甲，取材乙可交给制图甲或乙；
+  起初制图甲、乙各自只能交给本域登记实例。此时普通链存在、任一单域不可用时仍可从头走通
+  （`cold_blocked == ()`），但没有能保护已完成前缀的正常链（`protected` 为 `False`），
+  `run` 须在第一步之前抛 `NoProtectedWorkflow`。只新增「制图乙 → 登记甲」一条交接后，从头容灾结论
+  不变，途中保护变为可行，`run` 实际完成三步、且正常必须从取材乙开始。
+
